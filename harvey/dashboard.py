@@ -1445,6 +1445,53 @@ async def get_campaigns():
     return rows
 
 
+# Below this many sent contacts a niche's rates are noise: one reply more or
+# less swings them by several points.
+NICHE_MIN_SENT = 30
+
+
+@app.get("/api/niches")
+async def get_niches():
+    """Results per industry, summed across every campaign written for it.
+
+    The Writer starts a new campaign per batch, so one niche is spread over
+    several campaigns; this is the view that answers "which niche works".
+    A reply counts once per person, whatever its thread length.
+    """
+    sent_marks = ",".join("?" * len(SENT_STATUSES))
+    rows = await query_db(
+        f"""SELECT COALESCE(NULLIF(TRIM(p.industry), ''), 'Unassigned') AS niche,
+                   COUNT(*) AS contacts,
+                   SUM(CASE WHEN p.status != 'new'
+                             OR EXISTS (SELECT 1 FROM outbox o WHERE o.prospect_id = p.id)
+                            THEN 1 ELSE 0 END) AS drafted,
+                   SUM(CASE WHEN p.status IN ({sent_marks}) THEN 1 ELSE 0 END) AS sent,
+                   SUM(CASE WHEN v.intent IS NOT NULL THEN 1 ELSE 0 END) AS replied,
+                   SUM(CASE WHEN v.intent = 'interested' THEN 1 ELSE 0 END) AS interested,
+                   SUM(CASE WHEN v.intent = 'objection' THEN 1 ELSE 0 END) AS objections,
+                   SUM(CASE WHEN v.intent = 'not_interested' THEN 1 ELSE 0 END) AS not_interested,
+                   SUM(CASE WHEN p.status = 'opted_out' THEN 1 ELSE 0 END) AS opted_out,
+                   SUM(CASE WHEN p.status IN ('meeting', 'closed') THEN 1 ELSE 0 END) AS meetings
+              FROM prospects p
+              -- Where a person stands now: their latest classified reply.
+              LEFT JOIN (SELECT prospect_id, intent,
+                                ROW_NUMBER() OVER (PARTITION BY prospect_id
+                                                   ORDER BY updated_at DESC) AS rn
+                           FROM conversations WHERE COALESCE(intent, '') != '') v
+                     ON v.prospect_id = p.id AND v.rn = 1
+             WHERE p.email_status IN ('verified', 'risky')
+             GROUP BY niche
+             ORDER BY sent DESC, contacts DESC""",
+        SENT_STATUSES,
+    )
+    for r in rows:
+        sent = r["sent"] or 0
+        r["reply_rate"] = round(100 * (r["replied"] or 0) / sent, 1) if sent else None
+        r["interest_rate"] = round(100 * (r["interested"] or 0) / sent, 1) if sent else None
+        r["enough_data"] = sent >= NICHE_MIN_SENT
+    return {"niches": rows, "min_sent": NICHE_MIN_SENT}
+
+
 @app.get("/api/prospects/{prospect_id}/opt-out")
 async def get_opt_out(prospect_id: str):
     """Why this person is opted out: the rule, the words and their message."""

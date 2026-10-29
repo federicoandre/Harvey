@@ -2357,7 +2357,43 @@ function campaignProgress(c) {
       '<span><i class="' + p[2] + '"></i>' + p[0] + ' <b>' + p[1] + '</b></span>').join('') + '</div></div>';
 }
 
+// One row per industry, summed over every campaign written for it: the
+// Writer splits a niche across many campaigns, so this is where you compare.
+async function loadNiches() {
+  const el = document.getElementById('niches-summary');
+  const data = await api('/api/niches');
+  if (!data || !(data.niches || []).length) { el.innerHTML = ''; return; }
+  const pct = (v) => v === null || v === undefined ? '<span class="muted">&ndash;</span>' : v + '%';
+  const rated = data.niches.filter(n => n.enough_data && n.reply_rate !== null);
+  const best = rated.length > 1 ? rated.reduce((a, b) => (b.reply_rate > a.reply_rate ? b : a)) : null;
+  let h = '<div class="card flush" style="margin-bottom:16px"><div class="card-head" style="display:block">' +
+    '<h3>Results by niche</h3>' +
+    '<div class="meta" style="margin-top:2px">Every campaign for an industry added together. Rates are of contacts emailed; ' +
+    'below ' + data.min_sent + ' emailed they are too few to compare.</div></div>' +
+    '<table class="nowrap"><thead><tr><th>Niche</th><th class="num">Contacts</th><th class="num">Drafted</th>' +
+    '<th class="num">Emailed</th><th class="num">Replied</th><th class="num">Reply rate</th>' +
+    '<th class="num">Interested</th><th class="num">Objections</th><th class="num">Not interested</th>' +
+    '<th class="num">Opted out</th><th class="num">Meetings</th><th>Read</th></tr></thead><tbody>';
+  for (const n of data.niches) {
+    let read;
+    if (!n.sent) read = '<span class="badge t-idle">Nothing sent yet</span>';
+    else if (!n.enough_data) read = '<span class="badge t-waiting">' + n.sent + ' of ' + data.min_sent + ' emailed</span>';
+    else if (best && n === best) read = '<span class="badge t-good">Best reply rate</span>';
+    else if (n.reply_rate < 5) read = '<span class="badge t-bad">Below 5% benchmark</span>';
+    else read = '<span class="badge t-active">Within benchmark</span>';
+    h += '<tr><td class="cell-main">' + escHtml(n.niche) + '</td>' +
+      '<td class="num">' + n.contacts + '</td><td class="num muted">' + (n.drafted || 0) + '</td>' +
+      '<td class="num">' + (n.sent || 0) + '</td><td class="num">' + (n.replied || 0) + '</td>' +
+      '<td class="num">' + pct(n.reply_rate) + '</td><td class="num">' + (n.interested || 0) + '</td>' +
+      '<td class="num">' + (n.objections || 0) + '</td><td class="num">' + (n.not_interested || 0) + '</td>' +
+      '<td class="num muted">' + (n.opted_out || 0) + '</td><td class="num">' + (n.meetings || 0) + '</td>' +
+      '<td>' + read + '</td></tr>';
+  }
+  el.innerHTML = h + '</tbody></table></div>';
+}
+
 async function loadCampaigns() {
+  loadNiches();
   const el = document.getElementById('campaigns-list');
   const data = await api('/api/campaigns');
   if (!data) { el.innerHTML = offlineState(); return; }

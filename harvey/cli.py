@@ -552,6 +552,149 @@ def cmd_profile(args):
     asyncio.run(_profile())
 
 
+def cmd_import(args):
+    """Load your own list of companies (and optionally contacts) from a CSV.
+
+    Columns (header row, any order, case-insensitive): a website or domain is
+    required; name, industry, location, size and notes are optional. Spanish
+    headers work too (empresa, sitio, rubro, ubicacion, tamano). Rows already
+    on file are skipped, so re-importing the same list is safe.
+
+    With an email column, each row is also a contact at that company:
+    first_name, last_name and title are required for it, email_status
+    (verified / risky / invalid) says whether Harvey may write to it, and an
+    address with no status is kept as a guess, which is never sent to.
+    """
+    import csv
+    from harvey.state import StateManager
+    from harvey.models.company import Company
+    from harvey.models.prospect import Prospect
+    from harvey.collectors.discover import normalize_domain
+
+    aliases = {
+        "domain": ["domain", "dominio", "website", "web", "sitio", "sitio web",
+                   "url", "company domain", "company website"],
+        "name": ["name", "company", "company name", "empresa", "nombre",
+                 "razon social"],
+        "industry": ["industry", "industria", "rubro", "sector"],
+        "location": ["location", "city", "ciudad", "ubicacion", "provincia",
+                     "country", "pais"],
+        "company_size": ["size", "company size", "employees", "# employees",
+                         "empleados", "tamano", "dotacion"],
+        "notes": ["notes", "notas"],
+        "email": ["email", "mail", "correo", "work email"],
+        "email_status": ["email_status", "email status", "estado email"],
+        "first_name": ["first_name", "first name", "nombre de pila"],
+        "last_name": ["last_name", "last name", "apellido"],
+        "title": ["title", "job title", "cargo", "puesto"],
+        "seniority": ["seniority"],
+        "linkedin_url": ["linkedin", "linkedin_url", "linkedin url"],
+    }
+
+    def _plain(header: str) -> str:
+        import unicodedata
+        text = unicodedata.normalize("NFKD", header or "")
+        return "".join(c for c in text if not unicodedata.combining(c)).strip().lower()
+
+    path = Path(args.file)
+    if not path.exists():
+        print(f"\n  File not found: {path}\n")
+        sys.exit(1)
+
+    with open(path, newline="", encoding="utf-8-sig") as fh:
+        sample = fh.read(4096)
+        fh.seek(0)
+        try:
+            dialect = csv.Sniffer().sniff(sample, delimiters=",;\t")
+        except csv.Error:
+            dialect = csv.excel
+        reader = csv.DictReader(fh, dialect=dialect)
+        columns = {}
+        for field, names in aliases.items():
+            for header in reader.fieldnames or []:
+                if _plain(header) in names:
+                    columns[field] = header
+                    break
+        if "domain" not in columns:
+            print("\n  No website/domain column found. Headers seen: "
+                  f"{', '.join(reader.fieldnames or [])}\n")
+            sys.exit(1)
+        rows = list(reader)
+
+    async def _import():
+        state = StateManager()
+        await state.init_db()
+        added = skipped = invalid = 0
+        contacts_added = contacts_skipped = 0
+        for row in rows:
+            get = lambda f: (row.get(columns[f]) or "").strip() if f in columns else ""
+            domain = normalize_domain(get("domain"))
+            if not domain or "." not in domain:
+                invalid += 1
+                continue
+            existing = await state.get_company_by_domain(domain)
+            if existing:
+                company_id = existing.id
+                skipped += 1
+            else:
+                company_id = await state.add_company(Company(
+                    name=get("name") or domain,
+                    domain=domain,
+                    website=f"https://{domain}",
+                    industry=get("industry") or args.industry,
+                    company_size=get("company_size"),
+                    location=get("location"),
+                    notes=get("notes"),
+                    source="import",
+                    source_url=str(path.name),
+                ))
+                added += 1
+
+            email = get("email").lower()
+            if not email:
+                continue
+            status = get("email_status").lower()
+            if status not in ("verified", "risky", "invalid"):
+                status = "guess"
+            if await state.get_prospect_by_email(email):
+                contacts_skipped += 1
+                continue
+            prospect = Prospect(
+                company_id=company_id,
+                first_name=get("first_name"),
+                last_name=get("last_name"),
+                email=email,
+                email_status=status,
+                email_verified=(status == "verified"),
+                linkedin_url=get("linkedin_url"),
+                title=get("title"),
+                seniority=get("seniority"),
+                company=(existing.name if existing else get("name")) or domain,
+                # The Writer groups campaigns by industry, so a contact
+                # without one inherits its company's.
+                industry=(get("industry") or (existing.industry if existing else "")
+                          or args.industry),
+                source="import",
+                source_url=str(path.name),
+            )
+            if not prospect.is_valid():
+                contacts_skipped += 1
+                continue
+            await state.add_prospect(prospect)
+            contacts_added += 1
+
+        print(f"\n  Imported {added} companies "
+              f"({skipped} already on file, {invalid} without a usable website).")
+        if "email" in columns:
+            print(f"  Imported {contacts_added} contacts "
+                  f"({contacts_skipped} already on file or missing name/title).")
+        if added or contacts_added:
+            print("  Next: harvey profile   (reads their sites, free)")
+            print("        harvey run       (finds the people and writes to them)\n")
+
+    asyncio.run(_import())
+
+
 def cmd_discover(args):
     """Find businesses. The only stage that spends money, so it estimates first."""
     from harvey.state import StateManager
@@ -1068,6 +1211,14 @@ def main():
     sub.add_argument("--no-profile", action="store_true",
                      help="Don't profile what was found (profiling is free)")
     sub.set_defaults(func=cmd_discover)
+
+    sub = subparsers.add_parser(
+        "import", help="Load your own list of companies from a CSV (free)")
+    sub.add_argument("file", help="CSV with a website/domain column; name, "
+                     "industry, location, size optional")
+    sub.add_argument("--industry", default="",
+                     help="Industry for rows that don't say (default: blank)")
+    sub.set_defaults(func=cmd_import)
 
     sub = subparsers.add_parser(
         "profile", help="Read discovered companies' websites (free, no Claude)")
